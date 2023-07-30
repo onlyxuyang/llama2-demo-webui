@@ -1,0 +1,72 @@
+from threading import Thread
+from typing import Iterator
+
+import sys
+import argparse
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+parser = argparse.ArgumentParser(prog='llama2 webui')
+parser.add_argument('-m', '--model', required=True, help='llama2 model path')
+parser.add_argument('-q', '--quantization', choices=["default", "4bit", "8bit"], default = "default", help='quantization')
+
+args = parser.parse_args()
+
+model_id = args.model
+load_in_4bit = args.quantization == "4bit"
+load_in_8bit = args.quantization == "8bit"
+
+if torch.cuda.is_available():
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        load_in_4bit = load_in_4bit,
+        load_in_8bit = load_in_8bit,
+        local_files_only=True,
+        torch_dtype=torch.float16,
+        device_map='auto'
+    )
+else:
+    model = None
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+
+def get_prompt(message: str, chat_history: list[tuple[str, str]],
+               system_prompt: str) -> str:
+    texts = [f'[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n']
+    for user_input, response in chat_history:
+        texts.append(f'{user_input.strip()} [/INST] {response.strip()} </s><s> [INST] ')
+    texts.append(f'{message.strip()} [/INST]')
+    return ''.join(texts)
+
+
+def run(message: str,
+        chat_history: list[tuple[str, str]],
+        system_prompt: str,
+        max_new_tokens: int = 1024,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50) -> Iterator[str]:
+    prompt = get_prompt(message, chat_history, system_prompt)
+    inputs = tokenizer([prompt], return_tensors='pt').to("cuda")
+
+    streamer = TextIteratorStreamer(tokenizer,
+                                    timeout=10.,
+                                    skip_prompt=True,
+                                    skip_special_tokens=True)
+    generate_kwargs = dict(
+        inputs,
+        streamer=streamer,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        top_p=top_p,
+        top_k=top_k,
+        temperature=temperature,
+        num_beams=1,
+    )
+    t = Thread(target=model.generate, kwargs=generate_kwargs)
+    t.start()
+
+    outputs = []
+    for text in streamer:
+        outputs.append(text)
+        yield ''.join(outputs)
